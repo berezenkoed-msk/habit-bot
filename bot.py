@@ -3,6 +3,7 @@ import os
 import re
 import random
 import datetime as dt
+from collections import defaultdict
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -19,13 +20,19 @@ DB_PATH = "habits.db"
 FREE_HABIT_LIMIT = 5
 PRO_HABIT_LIMIT = 20
 
-FREE_MAX_TIMES_PER_HABIT = 10   # можно снизить до 5, если хочешь
+FREE_MAX_TIMES_PER_HABIT = 10
 PRO_MAX_TIMES_PER_HABIT = 30
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # В Render добавишь в Environment
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твой Telegram user_id (для /статистика и тестового включения Pro)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+PORT = int(os.getenv("PORT", "10000"))
 
-PORT = int(os.getenv("PORT", "10000"))  # Render любит, чтобы сервис слушал порт
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set. Add BOT_TOKEN in Render environment variables.")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+scheduler = AsyncIOScheduler()
 
 # =============================
 # ТЕКСТЫ (тон "хороший друг")
@@ -33,21 +40,21 @@ PORT = int(os.getenv("PORT", "10000"))  # Render любит, чтобы серв
 START_TEXT = (
     "Привет! Я рядом, чтобы помочь тебе держать слово самому себе.\n"
     "Я напоминаю — ты отвечаешь *текстом*, как SMS.\n\n"
-    "Команды:\n"
-    "• /добавить — добавить привычку\n"
-    "• /список — список привычек\n"
-    "• /время — поменять времена привычки\n"
-    "• /удалить — удалить привычку\n"
-    "• /проверка — чек-ин сейчас\n\n"
-    "Ответ на чек-ин:\n"
-    "• \"12 выполнил\"\n"
-    "• \"12 не выполнил потому что устал\""
+    "Как проходит чек-ин:\n"
+    "— Я спрашиваю по очереди: «Сделал привычку …?»\n"
+    "— Ты отвечаешь: *да* или *нет* (можно: «нет потому что …»)\n\n"
+    "Команды (можно с / или без):\n"
+    "• добавить — добавить привычку\n"
+    "• список — список привычек\n"
+    "• время — поменять времена привычки\n"
+    "• удалить — удалить привычку\n"
+    "• проверка — чек-ин прямо сейчас\n"
 )
 
 ASK_HABIT_TITLE = (
     "Ок, создаём привычку.\n"
     "Напиши её одним сообщением.\n"
-    "Пример: «Вода — 2 стакана» или «Пресс 10 минут»."
+    "Пример: «Вода» или «Чтение 10 минут»."
 )
 
 ASK_HABIT_TIMES = (
@@ -64,36 +71,22 @@ BAD_TIME_FORMAT = (
     "Если несколько — через запятую: `09:00,12:00,18:00`"
 )
 
-NEED_ID_FORMAT = (
-    "Я понял мысль, но мне нужен номер привычки 🙂\n"
-    "Пример: `12 выполнил` или `12 не выполнил потому что устал`."
-)
-
 DONE_REPLIES = [
-    "Зафиксировал ✅ Красавчик. Ты укрепил привычку — это реально сила.",
-    "Есть! Это +1 к дисциплине. Спокойно и по факту — так и строится результат.",
-    "Сделано ✅ Ты сейчас управляешь днём, а не день тобой.",
-    "Отлично. Маленькое «выполнил» каждый раз делает тебя надёжнее для самого себя.",
-    "Засчитано ✅ Не настроение решает — привычка решает. И ты это показал.",
+    "Есть ✅ Красавчик. Это маленькая победа, которая копится в большую.",
+    "Засчитано ✅ Ты укрепляешь дисциплину. Спокойно, без пафоса — но мощно.",
+    "Отлично ✅ Так и строится характер: сделал — и точка.",
+    "Супер ✅ Это +1 к твоей надёжности перед самим собой.",
 ]
 
 MISS_ACK_WITH_REASON = [
     "Принято. Спасибо за честность. Завтра вернём ритм без героизма.",
-    "Ок, записал. Не ругаем себя — настраиваем систему. Завтра станет проще.",
-    "Понял. Такое бывает. Главное — ты не спрятался. Завтра возьмём реванш.",
+    "Ок. Не ругаем себя — настраиваем систему. Завтра станет проще.",
+    "Понял. Такое бывает. Главное — ты не спрятался. Завтра берём реванш.",
 ]
 
 ASK_REASON_TEXT = (
-    "Ок. Я закрываю отметку только после причины.\n"
-    "Напиши одним сообщением: почему не сделал?\n"
-    "Пример: «устал», «забыл», «не было времени»."
-)
-
-CHECKIN_TEMPLATE = (
-    "Чек-ин по привычке *#{hid}: {title}*.\n"
-    "Ответь текстом:\n"
-    "• `{hid} выполнил`\n"
-    "• `{hid} не выполнил потому что ...`"
+    "Ок. Скажи одной фразой: почему *нет*?\n"
+    "Примеры: «устал», «забыл», «не было времени»."
 )
 
 # =============================
@@ -117,9 +110,7 @@ def parse_times_csv(s: str) -> list[str] | None:
     for p in parts:
         if not is_valid_time(p):
             return None
-    # Уникализируем и сортируем по времени
-    uniq = sorted(set(parts))
-    return uniq
+    return sorted(set(parts))
 
 # =============================
 # БАЗА ДАННЫХ
@@ -149,7 +140,6 @@ async def init_db():
             time TEXT NOT NULL
         )""")
 
-        # checkins: запись факта, что мы спросили (pending) и потом закрыли done/miss
         await db.execute("""
         CREATE TABLE IF NOT EXISTS checkins(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,7 +217,6 @@ async def delete_habit(user_id: int, habit_id: int) -> bool:
 
 async def replace_habit_times(user_id: int, habit_id: int, times: list[str]) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        # проверяем, что привычка принадлежит пользователю
         cur = await db.execute("SELECT 1 FROM habits WHERE user_id=? AND id=? AND is_active=1", (user_id, habit_id))
         ok = await cur.fetchone()
         if not ok:
@@ -238,17 +227,7 @@ async def replace_habit_times(user_id: int, habit_id: int, times: list[str]) -> 
         await db.commit()
         return True
 
-async def habit_title_for_user(user_id: int, habit_id: int) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT title FROM habits WHERE user_id=? AND id=? AND is_active=1", (user_id, habit_id))
-        row = await cur.fetchone()
-        return row[0] if row else None
-
 async def ensure_checkin(user_id: int, habit_id: int, day: str, time_slot: str) -> bool:
-    """
-    Создаём checkin pending, если его ещё не было.
-    Возвращает True если создали новый, False если уже существовал.
-    """
     async with aiosqlite.connect(DB_PATH) as db:
         try:
             await db.execute(
@@ -258,17 +237,15 @@ async def ensure_checkin(user_id: int, habit_id: int, day: str, time_slot: str) 
             await db.commit()
             return True
         except Exception:
-            # конфликт уникального индекса или другое — считаем, что уже есть
             return False
 
-async def get_latest_pending_checkin(user_id: int, habit_id: int, day: str) -> int | None:
+async def get_checkin_id(user_id: int, habit_id: int, day: str, time_slot: str) -> int | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             SELECT id FROM checkins
-            WHERE user_id=? AND habit_id=? AND day=? AND status='pending'
-            ORDER BY time_slot DESC
+            WHERE user_id=? AND habit_id=? AND day=? AND time_slot=?
             LIMIT 1
-        """, (user_id, habit_id, day))
+        """, (user_id, habit_id, day, time_slot))
         row = await cur.fetchone()
         return row[0] if row else None
 
@@ -283,32 +260,224 @@ async def set_checkin_miss(checkin_id: int, reason: str):
         await db.commit()
 
 # =============================
-# СТЕЙТ ДИАЛОГА (MVP)
+# СТЕЙТЫ (MVP)
 # =============================
-STATE: dict[int, dict] = {}          # user_id -> {"mode": "...", ...}
-WAIT_REASON: dict[int, int] = {}     # user_id -> checkin_id
+STATE: dict[int, dict] = {}  # добавление/удаление/время
+SESSIONS: dict[int, dict] = {}  # чек-ин сессии: очередь привычек
+WAIT_REASON: dict[int, int] = {}  # user_id -> checkin_id (ждём причину "нет")
+
+YES_WORDS = {"да", "ага", "угу", "ok", "ок", "сделал", "выполнил", "готово", "✅", "yes"}
+NO_WORDS = {"нет", "не", "неа", "пропустил", "не сделал", "не выполнил", "no"}
+
+def norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+def parse_yes_no(text: str):
+    """
+    Возвращает:
+    ("yes", None) или ("no", reason_or_none) или None
+    """
+    t = norm(text)
+    if not t:
+        return None
+
+    # "нет потому что ..." / "нет, потому что ..."
+    if t.startswith("нет"):
+        reason = None
+        if "потому" in t:
+            after = t.split("потому", 1)[1]
+            after = after.replace("что", "", 1).strip(" :,-")
+            reason = after if after else None
+        elif "," in t:
+            after = t.split(",", 1)[1].strip()
+            reason = after if after else None
+        return ("no", reason)
+
+    # чистое "да"
+    if t in YES_WORDS or t.startswith("да "):
+        return ("yes", None)
+
+    # варианты "не сделал"
+    for w in ("не сделал", "не выполнил", "пропустил"):
+        if t.startswith(w):
+            # может быть причина после
+            reason = None
+            if "потому" in t:
+                after = t.split("потому", 1)[1]
+                after = after.replace("что", "", 1).strip(" :,-")
+                reason = after if after else None
+            elif "," in t:
+                after = t.split(",", 1)[1].strip()
+                reason = after if after else None
+            return ("no", reason)
+
+    if t in NO_WORDS:
+        return ("no", None)
+
+    return None
 
 # =============================
-# БОТ
+# ЧЕК-ИН СЕССИЯ (Вариант Б)
 # =============================
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set. Add BOT_TOKEN in Render environment variables.")
+async def start_checkin_session(uid: int, habits: list[tuple[int, str]], time_slot: str):
+    """
+    Запускаем диалог чек-ина: спрашиваем по очереди.
+    """
+    if not habits:
+        return
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-scheduler = AsyncIOScheduler()
+    day = dt.date.today().isoformat()
+
+    # создаём pending checkins (чтобы потом закрывать их)
+    for hid, _title in habits:
+        await ensure_checkin(uid, hid, day, time_slot)
+
+    SESSIONS[uid] = {
+        "queue": habits,
+        "idx": 0,
+        "day": day,
+        "time_slot": time_slot
+    }
+    await ask_next_habit(uid)
+
+async def ask_next_habit(uid: int):
+    sess = SESSIONS.get(uid)
+    if not sess:
+        return
+
+    idx = sess["idx"]
+    queue = sess["queue"]
+    if idx >= len(queue):
+        # сессия закончена
+        SESSIONS.pop(uid, None)
+        await bot.send_message(uid, "Чек-ин завершён ✅ Продолжаем спокойно и по плану.")
+        return
+
+    hid, title = queue[idx]
+    text = (
+        f"Сделал привычку: *{title}*?\n"
+        "Ответь: *да* или *нет*\n"
+        "Можно так: `нет потому что устал`"
+    )
+    await bot.send_message(uid, text, parse_mode="Markdown")
+
+async def handle_session_answer(m: Message) -> bool:
+    """
+    Возвращает True если сообщение было обработано внутри сессии.
+    """
+    uid = m.from_user.id
+
+    # Если ждём причину — это приоритет
+    if uid in WAIT_REASON:
+        checkin_id = WAIT_REASON.pop(uid)
+        reason = m.text.strip()
+        await set_checkin_miss(checkin_id, reason)
+        await m.answer(random.choice(MISS_ACK_WITH_REASON))
+        # продолжаем сессию
+        if uid in SESSIONS:
+            SESSIONS[uid]["idx"] += 1
+            await ask_next_habit(uid)
+        return True
+
+    sess = SESSIONS.get(uid)
+    if not sess:
+        return False
+
+    parsed = parse_yes_no(m.text)
+    if not parsed:
+        await m.answer("Я понял, что это ответ, но мне нужно просто: *да* или *нет* 🙂", parse_mode="Markdown")
+        return True
+
+    answer, reason = parsed
+    idx = sess["idx"]
+    hid, _title = sess["queue"][idx]
+    day = sess["day"]
+    time_slot = sess["time_slot"]
+
+    checkin_id = await get_checkin_id(uid, hid, day, time_slot)
+    if checkin_id is None:
+        # на всякий случай
+        await ensure_checkin(uid, hid, day, time_slot)
+        checkin_id = await get_checkin_id(uid, hid, day, time_slot)
+
+    if answer == "yes":
+        if checkin_id is not None:
+            await set_checkin_done(checkin_id)
+        await m.answer(random.choice(DONE_REPLIES))
+        sess["idx"] += 1
+        await ask_next_habit(uid)
+        return True
+
+    # answer == "no"
+    if reason:
+        if checkin_id is not None:
+            await set_checkin_miss(checkin_id, reason)
+        await m.answer(random.choice(MISS_ACK_WITH_REASON))
+        sess["idx"] += 1
+        await ask_next_habit(uid)
+        return True
+    else:
+        # просим причину
+        if checkin_id is not None:
+            WAIT_REASON[uid] = checkin_id
+        await m.answer(ASK_REASON_TEXT)
+        return True
 
 # =============================
-# КОМАНДЫ (русские)
+# НАПОМИНАНИЯ
 # =============================
-@dp.message(Command("старт"))
+async def scheduler_tick():
+    """
+    Каждую минуту смотрим, какие привычки должны спроситься сейчас,
+    и запускаем для каждого пользователя одну сессию.
+    """
+    now = dt.datetime.now()
+    hhmm = now.strftime("%H:%M")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT h.user_id, h.id, h.title
+            FROM habits h
+            JOIN habit_times ht ON ht.habit_id = h.id
+            WHERE h.is_active=1 AND ht.time=?
+            ORDER BY h.user_id, h.id
+        """, (hhmm,))
+        rows = await cur.fetchall()
+
+    grouped = defaultdict(list)
+    for uid, hid, title in rows:
+        grouped[int(uid)].append((int(hid), str(title)))
+
+    for uid, habits in grouped.items():
+        # если уже идёт сессия — не мешаем
+        if uid in SESSIONS or uid in WAIT_REASON:
+            continue
+        await start_checkin_session(uid, habits, hhmm)
+
+async def start_manual_checkin(uid: int):
+    habits = await list_habits(uid)
+    if not habits:
+        await bot.send_message(uid, "Пока нет привычек. Напиши «добавить» — и сделаем первую.")
+        return
+    if uid in SESSIONS or uid in WAIT_REASON:
+        await bot.send_message(uid, "Мы уже в процессе чек-ина 🙂 Ответь *да/нет* на текущий вопрос.", parse_mode="Markdown")
+        return
+    await start_checkin_session(uid, [(hid, title) for hid, title in habits], "manual")
+
+# =============================
+# КОМАНДЫ (и / и без /)
+# =============================
+def is_text_cmd(m: Message, cmd: str) -> bool:
+    return norm(m.text) == cmd
+
 @dp.message(Command("start"))
+@dp.message(Command("старт"))
 async def cmd_start(m: Message):
     await ensure_user(m.from_user.id)
     await m.answer(START_TEXT, parse_mode="Markdown")
 
 @dp.message(Command("добавить"))
-async def cmd_add(m: Message):
+async def cmd_add_slash(m: Message):
     uid = m.from_user.id
     await ensure_user(uid)
 
@@ -323,50 +492,49 @@ async def cmd_add(m: Message):
     await m.answer(ASK_HABIT_TITLE)
 
 @dp.message(Command("список"))
-async def cmd_list(m: Message):
+async def cmd_list_slash(m: Message):
     uid = m.from_user.id
     await ensure_user(uid)
 
     habits = await list_habits(uid)
     if not habits:
-        await m.answer("Пока нет привычек. Напиши /добавить — и сделаем первую.")
+        await m.answer("Пока нет привычек. Напиши «добавить» — и сделаем первую.")
         return
 
     lines = ["Вот твои привычки:"]
     for hid, title in habits:
         times = await get_habit_times(hid)
         tline = ", ".join(times) if times else "—"
-        lines.append(f"\n*#{hid}* {title}\n⏰ {tline}")
+        lines.append(f"\n*{title}*\n⏰ {tline}")
     await m.answer("\n".join(lines), parse_mode="Markdown")
 
 @dp.message(Command("удалить"))
-async def cmd_delete(m: Message):
+async def cmd_delete_slash(m: Message):
     uid = m.from_user.id
     await ensure_user(uid)
     STATE[uid] = {"mode": "wait_delete_id"}
-    await m.answer("Ок. Напиши номер привычки, которую удалить. Пример: `12`", parse_mode="Markdown")
+    await m.answer("Ок. Напиши *точное название привычки*, которую удалить.\nПример: `Вода`", parse_mode="Markdown")
 
 @dp.message(Command("время"))
-async def cmd_time(m: Message):
+async def cmd_time_slash(m: Message):
     uid = m.from_user.id
     await ensure_user(uid)
     STATE[uid] = {"mode": "wait_time_change"}
     await m.answer(
         "Поменяем времена.\n"
         "Напиши так:\n"
-        "`12 09:00,12:00,18:00`\n"
-        "(номер + времена через запятую, формат ЧЧ:ММ)",
+        "`Вода 09:00,12:00,18:00`\n"
+        "(название + времена через запятую, формат ЧЧ:ММ)",
         parse_mode="Markdown"
     )
 
 @dp.message(Command("проверка"))
-async def cmd_check(m: Message):
+async def cmd_check_slash(m: Message):
     uid = m.from_user.id
     await ensure_user(uid)
-    await send_manual_checkins(uid)
-    await m.answer("Ок. Я отправил чек-ин по всем привычкам.")
+    await start_manual_checkin(uid)
 
-# Админ-команды (только для тебя)
+# Админ-статистика (если ADMIN_ID задан)
 @dp.message(Command("статистика"))
 async def cmd_stats(m: Message):
     if ADMIN_ID and m.from_user.id != ADMIN_ID:
@@ -379,7 +547,6 @@ async def cmd_stats(m: Message):
         cur = await db.execute("SELECT COUNT(*) FROM users WHERE substr(last_seen,1,10)=?", (today,))
         (active_today,) = await cur.fetchone()
 
-        # новые за сегодня = created_at сегодня
         cur = await db.execute("SELECT COUNT(*) FROM users WHERE substr(created_at,1,10)=?", (today,))
         (new_today,) = await cur.fetchone()
 
@@ -390,117 +557,33 @@ async def cmd_stats(m: Message):
         f"🆕 Новых сегодня: {new_today}"
     )
 
-@dp.message(Command("setpro"))
-async def cmd_setpro(m: Message):
-    if ADMIN_ID and m.from_user.id != ADMIN_ID:
-        return
-    uid = m.from_user.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET plan='pro' WHERE user_id=?", (uid,))
-        await db.commit()
-    await m.answer("Готово. План: PRO (лимиты увеличены).")
-
-@dp.message(Command("setfree"))
-async def cmd_setfree(m: Message):
-    if ADMIN_ID and m.from_user.id != ADMIN_ID:
-        return
-    uid = m.from_user.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET plan='free' WHERE user_id=?", (uid,))
-        await db.commit()
-    await m.answer("Ок. План: FREE.")
-
 # =============================
-# ЛОГИКА ЧЕК-ИНОВ
-# =============================
-async def send_checkin(uid: int, hid: int, title: str, time_slot: str):
-    day = dt.date.today().isoformat()
-    created = await ensure_checkin(uid, hid, day, time_slot)
-    if not created:
-        return  # уже отправляли этот слот
-    text = CHECKIN_TEMPLATE.format(hid=hid, title=title)
-    await bot.send_message(uid, text, parse_mode="Markdown")
-
-async def send_manual_checkins(uid: int):
-    habits = await list_habits(uid)
-    for hid, title in habits:
-        await send_checkin(uid, hid, title, "manual")
-
-async def scheduler_tick():
-    """Проверяем каждую минуту: есть ли привычки с таким временем."""
-    now = dt.datetime.now()
-    hhmm = now.strftime("%H:%M")
-    day = dt.date.today().isoformat()
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Получаем все совпадения времени
-        cur = await db.execute("""
-            SELECT h.user_id, h.id, h.title
-            FROM habits h
-            JOIN habit_times ht ON ht.habit_id = h.id
-            WHERE h.is_active=1 AND ht.time=?
-        """, (hhmm,))
-        rows = await cur.fetchall()
-
-    # Шлём чек-ин
-    for uid, hid, title in rows:
-        # ensure_user на всякий (если юзер уже есть — просто обновит last_seen в других местах)
-        await send_checkin(uid, hid, title, hhmm)
-
-# =============================
-# ПАРСИНГ ОТВЕТОВ "12 выполнил / не выполнил ..."
-# =============================
-def parse_report(text: str):
-    """
-    Возвращает:
-    ("done", habit_id) или ("miss", habit_id, reason_or_none) или None
-    """
-    t = text.strip().lower()
-    m = re.match(r"^(\d+)\s+(.+)$", t)
-    if not m:
-        return None
-
-    habit_id = int(m.group(1))
-    rest = m.group(2).strip()
-
-    done_words = ["выполнил", "сделал", "готово", "выполнено"]
-    miss_words = ["не выполнил", "не сделал", "не выполнено", "пропустил"]
-
-    if any(rest.startswith(w) for w in done_words):
-        return ("done", habit_id)
-
-    if any(rest.startswith(w) for w in miss_words):
-        reason = None
-        # "потому что ..."
-        if "потому" in rest:
-            after = rest.split("потому", 1)[1]
-            after = after.replace("что", "", 1).strip(" :,-")
-            reason = after if after else None
-        # "не сделал, устал"
-        elif "," in rest:
-            after = rest.split(",", 1)[1].strip()
-            reason = after if after else None
-        return ("miss", habit_id, reason)
-
-    return None
-
-# =============================
-# ТЕКСТОВОЙ РОУТЕР (основа всего)
+# ТЕКСТОВОЙ РОУТЕР (включая команды без / и ответы да/нет)
 # =============================
 @dp.message(F.text)
 async def text_router(m: Message):
     uid = m.from_user.id
     await ensure_user(uid)
 
-    # 1) Если ждём причину после "не выполнил"
-    if uid in WAIT_REASON:
-        checkin_id = WAIT_REASON.pop(uid)
-        reason = m.text.strip()
-        await set_checkin_miss(checkin_id, reason)
-        await m.answer(random.choice(MISS_ACK_WITH_REASON))
+    # 1) если идёт сессия — сначала пробуем обработать "да/нет"
+    if await handle_session_answer(m):
         return
 
-    # 2) Флоу добавления привычки
+    # 2) текстовые команды без /
+    t = norm(m.text)
+
+    if t == "добавить":
+        return await cmd_add_slash(m)
+    if t == "список":
+        return await cmd_list_slash(m)
+    if t == "удалить":
+        return await cmd_delete_slash(m)
+    if t == "время":
+        return await cmd_time_slash(m)
+    if t == "проверка":
+        return await cmd_check_slash(m)
+
+    # 3) флоу добавления привычки
     st = STATE.get(uid, {})
     mode = st.get("mode")
 
@@ -509,6 +592,16 @@ async def text_router(m: Message):
         if len(title) < 2:
             await m.answer("Слишком коротко. Напиши привычку понятнее 🙂")
             return
+
+        # проверим лимит ещё раз
+        plan = await get_plan(uid)
+        limit = habit_limit(plan)
+        n = await count_habits(uid)
+        if n >= limit:
+            STATE.pop(uid, None)
+            await m.answer(f"Лимит привычек: {limit}. В Pro можно больше.")
+            return
+
         STATE[uid] = {"mode": "wait_times", "title": title}
         await m.answer(ASK_HABIT_TIMES, parse_mode="Markdown")
         return
@@ -523,45 +616,58 @@ async def text_router(m: Message):
         plan = await get_plan(uid)
         tlimit = times_limit(plan)
         if len(times) > tlimit:
-            await m.answer(f"Слишком много времён за раз: {len(times)}. Лимит для твоего плана: {tlimit}.")
+            await m.answer(f"Слишком много времён: {len(times)}. Лимит твоего плана: {tlimit}.")
             return
 
-        hid = await create_habit(uid, title, times)
+        _hid = await create_habit(uid, title, times)
         STATE.pop(uid, None)
         await m.answer(
-            f"Готово ✅ Привычка создана: *#{hid}* {title}\n"
+            f"Готово ✅ Привычка создана: *{title}*\n"
             f"⏰ {', '.join(times)}\n\n"
-            "Дальше — просто отвечай по номеру, когда я спрошу.",
+            "Когда придёт напоминание — я спрошу, а ты ответишь: *да* или *нет*.",
             parse_mode="Markdown"
         )
         return
 
-    # 3) Удаление привычки
+    # 4) удаление по названию
     if mode == "wait_delete_id":
-        try:
-            hid = int(m.text.strip())
-        except:
-            await m.answer("Нужен номер. Пример: `12`", parse_mode="Markdown")
-            return
-        ok = await delete_habit(uid, hid)
+        title = m.text.strip()
+        habits = await list_habits(uid)
+        match = None
+        for hid, htitle in habits:
+            if htitle.strip().lower() == title.strip().lower():
+                match = hid
+                break
         STATE.pop(uid, None)
-        await m.answer("Удалил ✅" if ok else "Не нашёл такую привычку у тебя. Проверь /список")
+        if not match:
+            await m.answer("Не нашёл привычку с таким названием. Проверь «список».")
+            return
+        ok = await delete_habit(uid, match)
+        await m.answer("Удалил ✅" if ok else "Не получилось удалить. Проверь «список».")
         return
 
-    # 4) Замена времён: "12 09:00,12:00"
+    # 5) смена времени по названию: "Вода 09:00,12:00"
     if mode == "wait_time_change":
         parts = m.text.strip().split(maxsplit=1)
         if len(parts) != 2:
-            await m.answer("Формат: `12 09:00,12:00,18:00`", parse_mode="Markdown")
+            await m.answer("Формат: `Вода 09:00,12:00,18:00`", parse_mode="Markdown")
             return
-        try:
-            hid = int(parts[0])
-        except:
-            await m.answer("Первым должен быть номер привычки. Пример: `12 09:00,18:00`", parse_mode="Markdown")
-            return
+        title = parts[0].strip()
         times = parse_times_csv(parts[1])
         if not times:
             await m.answer(BAD_TIME_FORMAT, parse_mode="Markdown")
+            return
+
+        habits = await list_habits(uid)
+        habit_id = None
+        for hid, htitle in habits:
+            if htitle.strip().lower() == title.lower():
+                habit_id = hid
+                break
+
+        if habit_id is None:
+            STATE.pop(uid, None)
+            await m.answer("Не нашёл привычку с таким названием. Проверь «список».")
             return
 
         plan = await get_plan(uid)
@@ -570,66 +676,16 @@ async def text_router(m: Message):
             await m.answer(f"Слишком много времён: {len(times)}. Лимит твоего плана: {tlimit}.")
             return
 
-        ok = await replace_habit_times(uid, hid, times)
+        ok = await replace_habit_times(uid, habit_id, times)
         STATE.pop(uid, None)
-        await m.answer("Обновил ⏰" if ok else "Не нашёл привычку. Проверь /список")
+        await m.answer("Обновил ⏰" if ok else "Не получилось обновить. Проверь «список».")
         return
 
-    # 5) Отметка выполнения (главное)
-    parsed = parse_report(m.text)
-    if not parsed:
-        # не мешаем обычной переписке — просто подскажем формат, если это похоже на попытку отчёта
-        if re.match(r"^\d+\s*$", m.text.strip()):
-            await m.answer(NEED_ID_FORMAT, parse_mode="Markdown")
-        return
-
-    day = dt.date.today().isoformat()
-
-    if parsed[0] == "done":
-        habit_id = parsed[1]
-        title = await habit_title_for_user(uid, habit_id)
-        if not title:
-            await m.answer("Не вижу у тебя привычку с таким номером. Проверь /список.")
-            return
-
-        checkin_id = await get_latest_pending_checkin(uid, habit_id, day)
-        # если нет pending (ответ “вне слота”), создадим manual и закроем
-        if checkin_id is None:
-            await ensure_checkin(uid, habit_id, day, "manual")
-            checkin_id = await get_latest_pending_checkin(uid, habit_id, day)
-
-        if checkin_id is not None:
-            await set_checkin_done(checkin_id)
-
-        await m.answer(random.choice(DONE_REPLIES))
-        return
-
-    if parsed[0] == "miss":
-        habit_id, reason = parsed[1], parsed[2]
-        title = await habit_title_for_user(uid, habit_id)
-        if not title:
-            await m.answer("Не вижу у тебя привычку с таким номером. Проверь /список.")
-            return
-
-        checkin_id = await get_latest_pending_checkin(uid, habit_id, day)
-        if checkin_id is None:
-            await ensure_checkin(uid, habit_id, day, "manual")
-            checkin_id = await get_latest_pending_checkin(uid, habit_id, day)
-
-        if checkin_id is None:
-            await m.answer("Странно, не могу найти слот для отметки. Попробуй /проверка и ответь снова.")
-            return
-
-        if reason:
-            await set_checkin_miss(checkin_id, reason)
-            await m.answer(random.choice(MISS_ACK_WITH_REASON))
-        else:
-            WAIT_REASON[uid] = checkin_id
-            await m.answer(ASK_REASON_TEXT)
-        return
+    # если это просто обычный текст — мягко молчим (чтобы бот не бесил)
+    return
 
 # =============================
-# HEALTH SERVER (для Render Web Service)
+# HEALTH SERVER (для Render)
 # =============================
 async def handle_health(_request):
     return web.Response(text="ok")
@@ -648,14 +704,11 @@ async def start_web_server():
 async def main():
     await init_db()
 
-    # Планировщик: каждую минуту проверяем времена
     scheduler.add_job(scheduler_tick, "cron", second=0)
     scheduler.start()
 
-    # Сервер для Render
     await start_web_server()
 
-    # Поллинг Telegram
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
